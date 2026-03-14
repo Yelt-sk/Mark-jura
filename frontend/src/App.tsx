@@ -3,13 +3,21 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { arrayMove } from '@dnd-kit/sortable';
 import { AnimatePresence, motion } from 'framer-motion';
 
+import { ApiClientError, analyzeStrategy, checkText } from './api';
 import { Canvas } from './components/Canvas';
 import { LegalPanel } from './components/LegalPanel';
 import { Sidebar } from './components/Sidebar';
-import { MODULES } from './data';
-import { AnalyzeStrategyResponse, StrategyStep, TextCheckResponse, TextViolation } from './types';
+import { MODULES, STRATEGY_TEMPLATES } from './data';
+import {
+  AnalyzeStrategyResponse,
+  LegalRequirement,
+  StrategyState,
+  StrategyStep,
+  TextCheckResponse,
+  TextViolation,
+} from './types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+type ThemeMode = 'light' | 'dark';
 
 function createDefaultSettings(moduleId: string): Record<string, unknown> {
   const module = MODULES.find((item) => item.id === moduleId);
@@ -21,6 +29,89 @@ function createDefaultSettings(moduleId: string): Record<string, unknown> {
     acc[setting.key] = setting.defaultValue;
     return acc;
   }, {});
+}
+
+/**
+ * Формирует стабильный ключ риска для хранения пользовательской отметки «учтено».
+ */
+function getRequirementKey(requirement: LegalRequirement): string {
+  return [
+    requirement.stage,
+    requirement.title,
+    requirement.requirement,
+    requirement.risk_type,
+    requirement.law_reference.law,
+    requirement.law_reference.article,
+  ].join('::');
+}
+
+/**
+ * Нормализует текст для устойчивого сравнения значений (регистры/пробелы).
+ */
+function normalizeText(value: string): string {
+  return value.trim().toLocaleLowerCase('ru-RU');
+}
+
+/**
+ * Ищет шаг стратегии, к которому относится риск из правовой панели.
+ */
+function findStepForRequirement(requirement: LegalRequirement, steps: StrategyStep[]): StrategyStep | null {
+  const requirementStage = normalizeText(requirement.stage);
+  if (!requirementStage) {
+    return null;
+  }
+
+  return (
+    steps.find(
+      (step) =>
+        normalizeText(step.module) === requirementStage || normalizeText(step.moduleId) === requirementStage,
+    ) ?? null
+  );
+}
+
+/**
+ * Готовит безопасное имя файла отчёта.
+ */
+function toSafeFileName(value: string): string {
+  const normalized = value.trim().replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+  return normalized || 'strategy';
+}
+
+/**
+ * Формирует и скачивает TXT-отчёт по юридической аналитике.
+ */
+function downloadTextReport(fileName: string, content: string): void {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(link.href);
+}
+
+/**
+ * Преобразует типизированную ошибку API в текст сводки для правовой панели.
+ */
+function mapAnalyzeErrorToSummary(error: unknown): string {
+  if (error instanceof ApiClientError) {
+    if (error.kind === 'network') {
+      return 'Ошибка соединения с backend. Проверьте запуск FastAPI-сервиса.';
+    }
+
+    if (error.kind === 'http') {
+      const statusPart = error.status ? `HTTP ${error.status}` : 'HTTP ошибка';
+      const detailsPart = error.details ? ` ${error.details}` : '';
+      return `Ошибка ответа backend (${statusPart}).${detailsPart}`;
+    }
+
+    if (error.kind === 'abort') {
+      return 'Запрос анализа был отменен.';
+    }
+  }
+
+  return 'Не удалось получить юридический анализ. Повторите попытку.';
 }
 
 function renderHighlightedText(sourceText: string, violations: TextViolation[]): ReactNode {
@@ -59,7 +150,10 @@ function renderHighlightedText(sourceText: string, violations: TextViolation[]):
 }
 
 export default function App() {
-  const [steps, setSteps] = useState<StrategyStep[]>([]);
+  const [strategy, setStrategy] = useState<StrategyState>({
+    name: 'Новая стратегия',
+    steps: [],
+  });
   const [analysis, setAnalysis] = useState<AnalyzeStrategyResponse>({
     requirements: [],
     summary: 'Добавьте этапы в канвас, чтобы получить правовой анализ.',
@@ -70,6 +164,11 @@ export default function App() {
   const [adText, setAdText] = useState('');
   const [textResult, setTextResult] = useState<TextCheckResponse | null>(null);
   const [isCheckingText, setIsCheckingText] = useState(false);
+
+  const [accountedRisks, setAccountedRisks] = useState<Record<string, boolean>>({});
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [highlightedStepId, setHighlightedStepId] = useState<string | null>(null);
+  const [themeMode, setThemeMode] = useState<ThemeMode>('light');
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
@@ -83,39 +182,38 @@ export default function App() {
   );
 
   useEffect(() => {
+    const storedTheme = window.localStorage.getItem('markjura-theme');
+    if (storedTheme === 'light' || storedTheme === 'dark') {
+      setThemeMode(storedTheme);
+      return;
+    }
+
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    setThemeMode(prefersDark ? 'dark' : 'light');
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', themeMode === 'dark');
+    window.localStorage.setItem('markjura-theme', themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
     const controller = new AbortController();
 
     const runAnalysis = async () => {
       setIsAnalyzing(true);
       try {
-        const payload = {
-          steps_config: steps.map((step) => ({
-            id: step.id,
-            module: step.module,
-            settings: step.settings,
-          })),
-        };
-
-        const response = await fetch(`${API_BASE_URL}/api/analyze-strategy`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error('Не удалось получить юридический анализ.');
-        }
-
-        const data = (await response.json()) as AnalyzeStrategyResponse;
+        const data = await analyzeStrategy(strategy.steps, controller.signal);
         setAnalysis(data);
       } catch (error) {
-        if ((error as Error).name !== 'AbortError') {
-          setAnalysis({
-            requirements: [],
-            summary: 'Ошибка соединения с backend. Проверьте запуск FastAPI-сервиса.',
-          });
+        if (error instanceof ApiClientError && error.kind === 'abort') {
+          return;
         }
+
+        setAnalysis({
+          requirements: [],
+          summary: mapAnalyzeErrorToSummary(error),
+        });
       } finally {
         setIsAnalyzing(false);
       }
@@ -124,7 +222,15 @@ export default function App() {
     void runAnalysis();
 
     return () => controller.abort();
-  }, [steps]);
+  }, [strategy.steps]);
+
+  useEffect(() => {
+    const existingKeys = new Set(analysis.requirements.map((item) => getRequirementKey(item)));
+    setAccountedRisks((prev) => {
+      const nextEntries = Object.entries(prev).filter(([riskKey]) => existingKeys.has(riskKey));
+      return Object.fromEntries(nextEntries);
+    });
+  }, [analysis.requirements]);
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
@@ -145,22 +251,32 @@ export default function App() {
         id: `step-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         moduleId: moduleDefinition.id,
         module: moduleDefinition.title,
+        subtitle: '',
         settings: createDefaultSettings(moduleDefinition.id),
       };
 
-      setSteps((prev) => {
-        if (prev.length === 0 || overId === 'canvas-drop-zone') {
-          return [...prev, newStep];
+      setStrategy((prev) => {
+        if (prev.steps.length === 0 || overId === 'canvas-drop-zone') {
+          return {
+            ...prev,
+            steps: [...prev.steps, newStep],
+          };
         }
 
-        const overIndex = prev.findIndex((item) => item.id === overId);
+        const overIndex = prev.steps.findIndex((item) => item.id === overId);
         if (overIndex < 0) {
-          return [...prev, newStep];
+          return {
+            ...prev,
+            steps: [...prev.steps, newStep],
+          };
         }
 
-        const clone = [...prev];
+        const clone = [...prev.steps];
         clone.splice(overIndex, 0, newStep);
-        return clone;
+        return {
+          ...prev,
+          steps: clone,
+        };
       });
       return;
     }
@@ -170,20 +286,24 @@ export default function App() {
       return;
     }
 
-    setSteps((prev) => {
-      const oldIndex = prev.findIndex((item) => item.id === activeId);
-      const newIndex = prev.findIndex((item) => item.id === overId);
+    setStrategy((prev) => {
+      const oldIndex = prev.steps.findIndex((item) => item.id === activeId);
+      const newIndex = prev.steps.findIndex((item) => item.id === overId);
       if (oldIndex < 0 || newIndex < 0) {
         return prev;
       }
 
-      return arrayMove(prev, oldIndex, newIndex);
+      return {
+        ...prev,
+        steps: arrayMove(prev.steps, oldIndex, newIndex),
+      };
     });
   };
 
   const handleSettingsChange = (stepId: string, settingKey: string, value: unknown) => {
-    setSteps((prev) =>
-      prev.map((step) =>
+    setStrategy((prev) => ({
+      ...prev,
+      steps: prev.steps.map((step) =>
         step.id === stepId
           ? {
               ...step,
@@ -194,61 +314,205 @@ export default function App() {
             }
           : step,
       ),
-    );
+    }));
+  };
+
+  const handleSubtitleChange = (stepId: string, subtitle: string) => {
+    setStrategy((prev) => ({
+      ...prev,
+      steps: prev.steps.map((step) =>
+        step.id === stepId
+          ? {
+              ...step,
+              subtitle,
+            }
+          : step,
+      ),
+    }));
   };
 
   const handleRemoveStep = (stepId: string) => {
-    setSteps((prev) => prev.filter((step) => step.id !== stepId));
+    setStrategy((prev) => ({
+      ...prev,
+      steps: prev.steps.filter((step) => step.id !== stepId),
+    }));
+  };
+
+  const handleToggleRiskAccounted = (requirement: LegalRequirement, isChecked: boolean) => {
+    const riskKey = getRequirementKey(requirement);
+    setAccountedRisks((prev) => ({
+      ...prev,
+      [riskKey]: isChecked,
+    }));
+  };
+
+  const isRiskAccounted = (requirement: LegalRequirement): boolean => {
+    const riskKey = getRequirementKey(requirement);
+    return Boolean(accountedRisks[riskKey]);
+  };
+
+  const handleStrategyNameChange = (nextName: string) => {
+    setStrategy((prev) => ({
+      ...prev,
+      name: nextName,
+    }));
+  };
+
+  const handleApplyTemplate = () => {
+    const template = STRATEGY_TEMPLATES.find((item) => item.id === selectedTemplateId);
+    if (!template) {
+      return;
+    }
+
+    const templateSteps: StrategyStep[] = template.steps
+      .map((templateStep) => {
+        const moduleDefinition = moduleMap[templateStep.moduleId];
+        if (!moduleDefinition) {
+          return null;
+        }
+
+        return {
+          id: `step-${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${templateStep.moduleId}`,
+          moduleId: moduleDefinition.id,
+          module: moduleDefinition.title,
+          subtitle: templateStep.subtitle,
+          settings: {
+            ...createDefaultSettings(moduleDefinition.id),
+            ...(templateStep.settings ?? {}),
+          },
+        } satisfies StrategyStep;
+      })
+      .filter((item): item is StrategyStep => item !== null);
+
+    setStrategy({
+      name: template.name,
+      steps: templateSteps,
+    });
+    setHighlightedStepId(null);
+  };
+
+  const handleSaveReport = () => {
+    const reportDate = new Date().toLocaleString('ru-RU');
+    const fileSafeStrategyName = toSafeFileName(strategy.name);
+    const reportLines: string[] = [
+      'Mark&Jura — Юридический отчет по стратегии',
+      `Стратегия: ${strategy.name.trim() || 'Без названия'}`,
+      `Дата экспорта: ${reportDate}`,
+      '',
+      `Сводка: ${analysis.summary}`,
+      '',
+      `Количество требований: ${analysis.requirements.length}`,
+      '',
+    ];
+
+    analysis.requirements.forEach((item, index) => {
+      const accountedText = isRiskAccounted(item) ? 'Да' : 'Нет';
+      reportLines.push(`${index + 1}. ${item.title}`);
+      reportLines.push(`   Этап: ${item.stage}`);
+      reportLines.push(`   Тип риска: ${item.risk_type}`);
+      reportLines.push(`   Уровень: ${item.severity}`);
+      reportLines.push(`   Требование: ${item.requirement}`);
+      reportLines.push(`   Рекомендация: ${item.recommendation}`);
+      reportLines.push(
+        `   Норма: ${item.law_reference.law}, ${item.law_reference.article} — ${item.law_reference.description}`,
+      );
+      reportLines.push(`   Риск учтен: ${accountedText}`);
+      reportLines.push('');
+    });
+
+    downloadTextReport(`legal-report-${fileSafeStrategyName}.txt`, reportLines.join('\n'));
   };
 
   const handleTextCheck = async () => {
     if (!adText.trim()) {
-      setTextResult({ violations: [], has_violations: false });
+      setTextResult({
+        violations: [],
+        has_violations: false,
+        detected_words: [],
+        has_anglicisms: false,
+        detected_anglicisms: [],
+      });
       return;
     }
 
     setIsCheckingText(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/check-text`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: adText }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Не удалось проверить рекламный текст.');
-      }
-
-      const result = (await response.json()) as TextCheckResponse;
+      const result = await checkText(adText);
       setTextResult(result);
     } catch {
-      setTextResult({ violations: [], has_violations: false });
+      setTextResult({
+        violations: [],
+        has_violations: false,
+        detected_words: [],
+        has_anglicisms: false,
+        detected_anglicisms: [],
+      });
     } finally {
       setIsCheckingText(false);
     }
   };
 
+  const handleRiskClick = (requirement: LegalRequirement) => {
+    const relatedStep = findStepForRequirement(requirement, strategy.steps);
+    if (!relatedStep) {
+      return;
+    }
+
+    setHighlightedStepId(relatedStep.id);
+
+    window.setTimeout(() => {
+      const element = document.getElementById(`strategy-step-${relatedStep.id}`);
+      element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 0);
+
+    window.setTimeout(() => {
+      setHighlightedStepId((prev) => (prev === relatedStep.id ? null : prev));
+    }, 2500);
+  };
+
   return (
-    <div className="min-h-screen bg-slate-100 p-4 text-slate-900 md:p-6">
-      <div className="mx-auto mb-4 max-w-[1600px] rounded-2xl bg-white px-4 py-4 shadow-sm ring-1 ring-slate-200 md:px-6">
-        <h1 className="text-2xl font-bold tracking-tight text-slate-800">Маркетинговый Юрист</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          Конструктор маркетинговой стратегии с автоматическим правовым контролем по ФЗ «О рекламе» и ФЗ «О персональных данных».
-        </p>
+    <div className="min-h-screen bg-slate-100 p-4 text-slate-900 transition-colors dark:bg-slate-900 dark:text-slate-100 md:p-6">
+      <div className="mx-auto mb-4 flex max-w-[1600px] items-start justify-between gap-3 rounded-2xl bg-white px-4 py-4 shadow-sm ring-1 ring-slate-200 transition-colors dark:bg-slate-800 dark:ring-slate-700 md:px-6">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-800 dark:text-slate-100">Mark&Jura</h1>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Конструктор маркетинговой стратегии с автоматическим правовым контролем по нормам рекламного,
+            потребительского и персонально-данного законодательства РФ.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setThemeMode((prev) => (prev === 'light' ? 'dark' : 'light'))}
+          className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600"
+          aria-label="Переключить тему интерфейса"
+        >
+          {themeMode === 'light' ? '🌙 Dark mode' : '☀️ Light mode'}
+        </button>
       </div>
 
       <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
         <main className="mx-auto grid max-w-[1600px] grid-cols-1 gap-4 lg:grid-cols-12">
           <div className="lg:col-span-3">
-            <Sidebar modules={MODULES} />
+            <Sidebar
+              modules={MODULES}
+              strategyName={strategy.name}
+              onStrategyNameChange={handleStrategyNameChange}
+              templates={STRATEGY_TEMPLATES}
+              selectedTemplateId={selectedTemplateId}
+              onTemplateSelect={setSelectedTemplateId}
+              onApplyTemplate={handleApplyTemplate}
+            />
           </div>
 
           <div className="lg:col-span-5">
             <Canvas
-              steps={steps}
+              steps={strategy.steps}
               moduleMap={moduleMap}
               onSettingsChange={handleSettingsChange}
+              onSubtitleChange={handleSubtitleChange}
               onRemoveStep={handleRemoveStep}
+              highlightedStepId={highlightedStepId}
             />
           </div>
 
@@ -258,6 +522,10 @@ export default function App() {
               summary={analysis.summary}
               isLoading={isAnalyzing}
               onOpenTextChecker={() => setTextModalOpen(true)}
+              onSaveReport={handleSaveReport}
+              onToggleRiskAccounted={handleToggleRiskAccounted}
+              isRiskAccounted={isRiskAccounted}
+              onRiskClick={handleRiskClick}
             />
           </div>
         </main>
@@ -275,19 +543,19 @@ export default function App() {
               initial={{ y: 20, opacity: 0 }}
               animate={{ y: 0, opacity: 1 }}
               exit={{ y: 12, opacity: 0 }}
-              className="w-full max-w-3xl rounded-2xl bg-white p-5 shadow-xl"
+              className="w-full max-w-3xl rounded-2xl bg-white p-5 shadow-xl dark:bg-slate-800"
             >
               <div className="mb-4 flex items-start justify-between">
                 <div>
-                  <h2 className="text-lg font-semibold text-slate-800">Проверка рекламного текста</h2>
-                  <p className="mt-1 text-sm text-slate-500">
+                  <h2 className="text-lg font-semibold text-slate-800 dark:text-slate-100">Проверка рекламного текста</h2>
+                  <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
                     Найдем рискованные формулировки и предложим юридически безопасные альтернативы.
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setTextModalOpen(false)}
-                  className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-600"
+                  className="rounded-md border border-slate-300 px-2 py-1 text-sm text-slate-600 dark:border-slate-600 dark:text-slate-200"
                 >
                   Закрыть
                 </button>
@@ -297,7 +565,7 @@ export default function App() {
                 value={adText}
                 onChange={(event) => setAdText(event.target.value)}
                 placeholder="Введите рекламный текст, например: Гарантируем результат, скидка 70% только сегодня..."
-                className="h-32 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none ring-blue-500 focus:ring"
+                className="h-32 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none ring-blue-500 focus:ring dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
               />
 
               <div className="mt-3 flex justify-end">
@@ -312,12 +580,26 @@ export default function App() {
               </div>
 
               {textResult && (
-                <section className="mt-4 space-y-3 rounded-xl bg-slate-50 p-3 ring-1 ring-slate-200">
-                  <h3 className="text-sm font-semibold text-slate-800">Результат анализа</h3>
+                <section className="mt-4 space-y-3 rounded-xl bg-slate-50 p-3 ring-1 ring-slate-200 dark:bg-slate-700/60 dark:ring-slate-600">
+                  <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-100">Результат анализа</h3>
 
-                  <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-700">
+                  <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-700 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200">
                     {renderHighlightedText(adText, textResult.violations)}
                   </div>
+
+                  {textResult.detected_words.length > 0 ? (
+                    <p className="rounded-lg bg-amber-100 p-2 text-sm text-amber-800">
+                      ⚠️ Обнаружены стоп-слова/бранные слова: {textResult.detected_words.join(', ')}.
+                    </p>
+                  ) : null}
+
+                  {textResult.has_anglicisms ? (
+                    <p className="rounded-lg bg-orange-100 p-2 text-sm text-orange-800">
+                      ⚠️ Обнаружены англицизмы: {textResult.detected_anglicisms.join(', ')}. Проверьте соблюдение
+                      требований законодательства о защите русского языка (ФЗ №53 «О государственном языке
+                      Российской Федерации»).
+                    </p>
+                  ) : null}
 
                   {!textResult.has_violations ? (
                     <p className="rounded-lg bg-emerald-100 p-2 text-sm text-emerald-700">
@@ -328,14 +610,14 @@ export default function App() {
                       {textResult.violations.map((item, index) => (
                         <article
                           key={`${item.start}-${item.end}-${index}`}
-                          className="rounded-lg bg-white p-3 ring-1 ring-slate-200"
+                          className="rounded-lg bg-white p-3 ring-1 ring-slate-200 dark:bg-slate-800 dark:ring-slate-600"
                         >
                           <p className="text-sm font-medium text-rose-700">⚠️ «{item.phrase}»</p>
-                          <p className="mt-1 text-xs text-slate-600">{item.explanation}</p>
+                          <p className="mt-1 text-xs text-slate-600 dark:text-slate-300">{item.explanation}</p>
                           <p className="mt-1 text-xs font-medium text-emerald-700">
                             Альтернатива: {item.suggestion}
                           </p>
-                          <p className="mt-1 text-[11px] text-slate-500">
+                          <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
                             {item.law_reference.law}, {item.law_reference.article}: {item.law_reference.description}
                           </p>
                         </article>

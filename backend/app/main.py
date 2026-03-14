@@ -3,19 +3,34 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from logic import analyze_strategy, check_ad_text
-from schemas import (
-    AnalyzeStrategyRequest,
-    AnalyzeStrategyResponse,
-    TextCheckRequest,
-    TextCheckResponse,
-)
+# Поддержка двух режимов запуска:
+# 1) как пакет: `uvicorn app.main:app`
+# 2) как модуль из директории app: `uvicorn main:app`
+try:
+    from .logic import analyze_strategy, check_ad_text
+    from .schemas import (
+        AnalyzeStrategyRequest,
+        AnalyzeStrategyResponse,
+        TextCheckRequest,
+        TextCheckResponse,
+    )
+except ImportError:
+    from logic import analyze_strategy, check_ad_text
+    from schemas import (
+        AnalyzeStrategyRequest,
+        AnalyzeStrategyResponse,
+        TextCheckRequest,
+        TextCheckResponse,
+    )
 
 # Инициализация API приложения.
 app = FastAPI(
-    title="Маркетинговый Юрист API",
+    title="Mark&Jura API",
     version="1.0.0",
-    description="REST API для анализа маркетинговой стратегии и рекламных текстов.",
+    description="REST API для анализа маркетинговой стратегии и рекламных текстов в контексте права РФ.",
+    openapi_url="/api/openapi.json",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
 )
 
 # CORS для локального frontend и демонстрационного запуска.

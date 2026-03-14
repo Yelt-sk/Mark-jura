@@ -14,6 +14,26 @@ class RiskLevel(str, Enum):
     HIGH = "high"
 
 
+class SeverityLevel(str, Enum):
+    """Текстовый уровень критичности для сортировки в UI."""
+
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class RiskType(str, Enum):
+    """Тип риска для фильтрации и группировки в правовой панели."""
+
+    ADVERTISING = "advertising"
+    PERSONAL_DATA = "personal_data"
+    CONSUMER_RIGHTS = "consumer_rights"
+    CHILDREN_AND_VULNERABLE = "children_and_vulnerable"
+    ETHICS = "ethics"
+    FINANCIAL_DISCLOSURE = "financial_disclosure"
+    DIGITAL_RIGHTS = "digital_rights"
+
+
 class LawReference(BaseModel):
     """Ссылка на норму закона."""
 
@@ -29,6 +49,8 @@ class LegalRequirement(BaseModel):
     title: str = Field(..., description="Краткое название требования")
     requirement: str = Field(..., description="Что нужно сделать, чтобы соблюдать закон")
     risk_level: RiskLevel = Field(..., description="Уровень риска")
+    severity: SeverityLevel = Field(..., description="Критичность для сортировки")
+    risk_type: RiskType = Field(..., description="Категория риска для фильтрации")
     recommendation: str = Field(..., description="Практическая рекомендация")
     law_reference: LawReference = Field(..., description="Ссылка на закон")
 
@@ -69,6 +91,8 @@ class ViolationMatch(BaseModel):
     explanation: str = Field(..., description="Почему это риск")
     suggestion: str = Field(..., description="Безопасная альтернатива")
     risk_level: RiskLevel = Field(..., description="Оценка риска")
+    severity: SeverityLevel = Field(..., description="Критичность для сортировки")
+    risk_type: RiskType = Field(..., description="Категория риска")
     law_reference: LawReference = Field(..., description="Ссылка на норму")
 
 
@@ -77,3 +101,15 @@ class TextCheckResponse(BaseModel):
 
     violations: list[ViolationMatch] = Field(default_factory=list)
     has_violations: bool = Field(..., description="Есть ли рисковые формулировки")
+    detected_words: list[str] = Field(
+        default_factory=list,
+        description="Список обнаруженных стоп-слов/бранных слов",
+    )
+    has_anglicisms: bool = Field(
+        default=False,
+        description="Обнаружены ли англицизмы (английские слова в русскоязычном тексте)",
+    )
+    detected_anglicisms: list[str] = Field(
+        default_factory=list,
+        description="Список обнаруженных англицизмов",
+    )
