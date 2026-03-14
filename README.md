@@ -1,5 +1,7 @@
 # Mark&Jura (Маркетинговый Юрист)
 
+Можете посмотреть проект так-же на http://yelt.tech/
+
 Short local run guide.
 
 ## Local stack
